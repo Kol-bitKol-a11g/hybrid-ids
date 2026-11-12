@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-ids"
+version = "1.0.0"
+description = "Гібридна система виявлення вторгнень: Suricata + XGBoost + автоенкодер"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Повний стек прототипу: основні моделі, балансування, REST API, PostgreSQL.
+full = [
+    "xgboost>=2.0.3",
+    "tensorflow>=2.15",
+    "imbalanced-learn>=0.12",
+    "fastapi>=0.109",
+    "uvicorn>=0.27",
+    "psycopg2-binary>=2.9",
+]
+dev = ["pytest>=8.0", "httpx>=0.26"]
+
+[project.scripts]
+hybrid-ids = "hybrid_ids.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

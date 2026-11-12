@@ -1,0 +1,99 @@
+# Розгортання прототипу: десять контейнерів.
+# Перед запуском навчіть моделі (каталог ./models) і задайте інтерфейс сенсора:
+#   IDS_INTERFACE=eth1 docker compose up -d --build
+
+x-app: &app
+  build: .
+  image: hybrid-ids-app
+  restart: unless-stopped
+
+x-db-url: &db-url postgresql://ids:${POSTGRES_PASSWORD:-ids}@ids-postgres:5432/hybrid_ids
+
+services:
+  suricata-sensor:              # сигнатурний детектор, журнал подій EVE JSON
+    image: jasonish/suricata:7.0.6
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW, SYS_NICE]
+    command: --af-packet=${IDS_INTERFACE:-eth0}
+    volumes:
+      - sensor-data:/var/log/suricata
+
+  cicflowmeter:                 # агрегація пакетів у потоки та обчислення ознак
+    build:
+      context: deploy
+      dockerfile: flowmeter.Dockerfile
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    command: -i ${IDS_INTERFACE:-eth0} -c /data/flows.csv
+    volumes:
+      - sensor-data:/data
+
+  xgboost-service:              # оцінка p_xgb
+    <<: *app
+    command: service xgboost --port 8001
+    ports: ["8001:8001"]
+    volumes:
+      - ./models:/app/models:ro
+
+  autoencoder-service:          # похибка реконструкції l_ae
+    <<: *app
+    command: service autoencoder --port 8002
+    ports: ["8002:8002"]
+    volumes:
+      - ./models:/app/models:ro
+
+  reconciliation-core:          # правило узгодження (3.1) і формування оповіщень
+    <<: *app
+    command: worker --flows /data/flows.csv --eve /data/eve.json
+    environment:
+      IDS_DB_URL: *db-url
+      IDS_XGB_URL: http://xgboost-service:8001
+      IDS_AE_URL: http://autoencoder-service:8002
+    volumes:
+      - ./models:/app/models:ro
+      - sensor-data:/data:ro
+    depends_on: [ids-postgres, xgboost-service, autoencoder-service]
+
+  fastapi-gateway:              # REST API для SOC
+    <<: *app
+    command: serve --port 8080
+    environment:
+      IDS_DB_URL: *db-url
+    ports: ["8080:8080"]
+    depends_on: [ids-postgres]
+
+  ids-postgres:                 # сховище оповіщень
+    image: postgres:16.1
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ids
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ids}
+      POSTGRES_DB: hybrid_ids
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  prometheus:                   # збирання метрик з /metrics
+    image: prom/prometheus:v2.49.1
+    ports: ["9090:9090"]
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:                      # панелі моніторингу
+    image: grafana/grafana:10.4.3
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  elasticsearch:                # зберігання сирих журналів детекторів
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+
+volumes:
+  sensor-data:
+  postgres-data:
+  es-data:

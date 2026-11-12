@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+# дані, навчені моделі та локальне сховище оповіщень не зберігаються в репозиторії
+data/
+models/
+*.db
+*.pcap
