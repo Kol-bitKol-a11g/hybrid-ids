@@ -1,60 +1,50 @@
-"""Тести модуля узгодження: кожна гілка правила (3.1) і матриці рішень (табл. 3.3)."""
-import numpy as np
-import pytest
+# REST API
 
-from hybrid_ids.config import Thresholds
-from hybrid_ids.reconciliation import (RULE_ML_CONFIDENT, RULE_NORMAL, RULE_RECONCILED,
-                                       RULE_REVIEW_ANOMALY, RULE_REVIEW_UNCERTAIN, RULE_SIGNATURE,
-                                       needs_autoencoder, reconcile, reconcile_batch)
-from hybrid_ids.schemas import Verdict
+Запуск: `python -m hybrid_ids serve --port 8080`. Інтерактивна документація Swagger UI: `http://localhost:8080/docs`.
 
-THR = Thresholds()   # p1 = 0,90; p2 = 0,30; tau1 = 0,025; tau2 = 0,010
+## GET /alerts
 
-# (p_sur, p_xgb, l_ae, очікуване рішення, гілка правила)
-CASES = [
-    (1, 0.05, 0.001, Verdict.ATTACK, RULE_SIGNATURE),          # пріоритет сигнатури над ML
-    (1, 0.99, None, Verdict.ATTACK, RULE_SIGNATURE),
-    (0, 0.9963, None, Verdict.ATTACK, RULE_ML_CONFIDENT),      # SYN-flood, підрозділ 3.4.1
-    (0, 0.67, 0.0341, Verdict.ATTACK, RULE_RECONCILED),        # обфускована SQL-ін'єкція
-    (0, 0.67, 0.020, Verdict.REVIEW, RULE_REVIEW_UNCERTAIN),
-    (0, 0.10, 0.005, Verdict.NORMAL, RULE_NORMAL),             # подвійне підтвердження норми
-    (0, 0.10, 0.015, Verdict.REVIEW, RULE_REVIEW_ANOMALY),
-    (0, 0.10, 0.040, Verdict.REVIEW, RULE_REVIEW_ANOMALY),
-    # значення на межах порогів
-    (0, 0.90, 0.030, Verdict.ATTACK, RULE_RECONCILED),         # p_xgb = p1: ще зона невизначеності
-    (0, 0.30, 0.030, Verdict.ATTACK, RULE_RECONCILED),         # p_xgb = p2: уже зона невизначеності
-    (0, 0.30, 0.025, Verdict.REVIEW, RULE_REVIEW_UNCERTAIN),   # l_ae = tau1 не перевищує порога
-    (0, 0.29, 0.010, Verdict.REVIEW, RULE_REVIEW_ANOMALY),     # l_ae = tau2 не підтверджує норму
-]
+Повертає оповіщення, новіші спершу.
 
+| Параметр | Тип | Опис |
+|---|---|---|
+| `time_from`, `time_to` | ISO 8601 | часовий діапазон |
+| `attack_class` | рядок | клас атаки, наприклад `DDoS` |
+| `min_confidence` | 0–1 | мінімальна оцінка `p_xgb` (сигнатурні оповіщення без оцінки мають 1) |
+| `limit` | 1–1000 | кількість записів, типово 100 |
 
-@pytest.mark.parametrize("p_sur, p_xgb, l_ae, verdict, rule", CASES)
-def test_rule_branches(p_sur, p_xgb, l_ae, verdict, rule):
-    decision = reconcile(p_sur, p_xgb, l_ae, THR)
-    assert (decision.verdict, decision.rule) == (verdict, rule)
+```bash
+curl "http://localhost:8080/alerts?attack_class=DDoS&min_confidence=0.9&limit=10"
+```
 
+## GET /health
 
-def test_batch_matches_scalar_rule():
-    p_sur, p_xgb, l_ae = (np.array([c[i] for c in CASES], dtype=float) for i in range(3))
-    verdicts, rules = reconcile_batch(p_sur, p_xgb, l_ae, THR)
-    assert list(verdicts) == [c[3].value for c in CASES]
-    assert list(rules) == [c[4] for c in CASES]
+```json
+{"suricata": "up", "xgboost": "up", "autoencoder": "up",
+ "last_inference_ms": 0.46, "queue_size": 0, "uptime_s": 3600}
+```
 
+## GET /metrics
 
-def test_autoencoder_is_skipped_when_decision_is_known():
-    assert not needs_autoencoder(1, 0.10, THR)      # рішення визначила сигнатура
-    assert not needs_autoencoder(0, 0.95, THR)      # впевнена оцінка класифікатора
-    assert needs_autoencoder(0, 0.50, THR)
-    assert needs_autoencoder(0, 0.10, THR)          # норма потребує другого підтвердження
-    with pytest.raises(ValueError):
-        reconcile(0, 0.50, None, THR)
+Метрики у форматі Prometheus: `ids_flows_total`, `ids_alerts_total`, `ids_alerts_last_hour{alert_type}`, `ids_response_time_ms`, `ids_autoencoder_share`, `ids_technical_errors_total`, `ids_queue_size`, `ids_false_alert_share`, `ids_detector_up{detector}`.
 
+## POST /verify/{flow_id}
 
-def test_thresholds_validation_and_scaling():
-    with pytest.raises(ValueError):
-        Thresholds(p1=0.3, p2=0.9)
-    with pytest.raises(ValueError):
-        Thresholds(tau1=0.01, tau2=0.02)
-    scaled = Thresholds().scaled_to(0.0296)         # удвічі більший базовий поріг
-    assert scaled.tau1 == pytest.approx(0.050) and scaled.tau2 == pytest.approx(0.020)
-    assert (scaled.p1, scaled.p2) == (0.90, 0.30)
+Фіксує вердикт аналітика SOC.
+
+```bash
+curl -X POST http://localhost:8080/verify/<flow_id> \
+     -H "Content-Type: application/json" \
+     -d '{"confirmed": false, "comment": "легітимне резервне копіювання"}'
+```
+
+Відповідь `404`, якщо оповіщення з таким `flow_id` немає.
+
+## Сервіси висновування
+
+У контейнерному розгортанні детектори доступні як окремі сервіси; вхід - нормалізовані вектори з 22 ознак.
+
+| Сервіс | Запит | Відповідь |
+|---|---|---|
+| `xgboost-service:8001` | `POST /predict {"features": [[...]]}` | `{"p_xgb": [...], "attack_class": [...]}` |
+| `autoencoder-service:8002` | `POST /score {"features": [[...]]}` | `{"l_ae": [...]}` |

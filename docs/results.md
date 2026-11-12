@@ -1,81 +1,65 @@
-"""Наскрізний тест конвеєра на синтетичних потоках (спрощені моделі scikit-learn)."""
-import numpy as np
-import pandas as pd
-import pytest
+# Результати експериментів
 
-from hybrid_ids.config import Settings
-from hybrid_ids.pipeline import HybridIDS
-from hybrid_ids.storage import AlertStore
-from hybrid_ids.suricata_runner import SuricataIndex, read_eve
-from hybrid_ids.synthetic import generate_flows, write_demo_eve
-from hybrid_ids.training import evaluate_models, prepare_dataset, train_models
+Значення отримано в кваліфікаційній роботі на тестових частинах наборів даних. Демонстраційний запуск на синтетичних потоках (`python -m hybrid_ids demo`) їх не відтворює.
 
+## 1 Порівняння моделей на CICIDS2017 (норма проти атаки)
 
-@pytest.fixture(scope="module")
-def workspace(tmp_path_factory):
-    work = tmp_path_factory.mktemp("ids")
-    flows = generate_flows(3000, seed=7)
-    flows.to_csv(work / "flows.csv", index=False)
-    write_demo_eve(flows, work / "eve.json", seed=7)
-    prepare_dataset([work / "flows.csv"], work / "processed")
-    train, val, test = (pd.read_csv(work / "processed" / f"{name}.csv") for name in ("train", "val", "test"))
-    summary = train_models(train, val, work / "models", backend="lite", calibrate=True)
-    ids = HybridIDS.load(Settings(models_dir=str(work / "models")), AlertStore("sqlite:///"))
-    return work, test, ids, summary
+| Модель | Accuracy | Precision | Recall | F1 | macro-F1 | ROC-AUC | Навчання, с | Висновування, мс |
+|---|---|---|---|---|---|---|---|---|
+| Random Forest | 0,967 | 0,911 | 0,941 | 0,926 | 0,952 | 0,987 | 86,4 | 1,85 |
+| **XGBoost** | **0,981** | **0,954** | **0,965** | **0,960** | **0,974** | **0,992** | 142,7 | **0,42** |
+| Автоенкодер | 0,864 | 0,802 | 0,891 | 0,844 | 0,897 | 0,918 | 312,5 | 3,12 |
+| SVM | 0,878 | 0,841 | 0,798 | 0,819 | 0,884 | 0,934 | 412,0 | 12,40 |
+| DNN | 0,943 | 0,902 | 0,892 | 0,897 | 0,933 | 0,967 | 198,3 | 0,95 |
+| LSTM | 0,921 | 0,886 | 0,864 | 0,875 | 0,920 | 0,951 | 487,6 | 5,30 |
+| Isolation Forest | 0,832 | 0,710 | 0,841 | 0,770 | 0,846 | 0,873 | 64,2 | 0,71 |
+| One-Class SVM | 0,772 | 0,665 | 0,802 | 0,727 | 0,818 | 0,821 | 38,1 | 8,20 |
 
+## 2 XGBoost на трьох наборах (багатокласова постановка)
 
-def test_training_summary(workspace):
-    _, _, ids, summary = workspace
-    assert summary["train_flows"] == 2100
-    assert "BENIGN" in summary["classes"] and summary["tau_base"] > 0
-    assert ids.thresholds.tau2 < ids.thresholds.tau_base < ids.thresholds.tau1
+| Набір даних | Accuracy | Precision | Recall | macro-F1 | ROC-AUC |
+|---|---|---|---|---|---|
+| CICIDS2017 | 0,962 | 0,948 | 0,933 | 0,931 | 0,976 |
+| NSL-KDD | 0,872 | 0,851 | 0,823 | 0,802 | 0,917 |
+| UNSW-NB15 | 0,883 | 0,861 | 0,832 | 0,819 | 0,931 |
 
+## 3 Абляційні досліди на CICIDS2017
 
-def test_pipeline_produces_alerts_and_respects_signature_priority(workspace):
-    work, test, ids, _ = workspace
-    index = SuricataIndex(read_eve(work / "eve.json"))
-    p_sur, _ = index.signals(test)
-    assert 0 < p_sur.sum() < len(test)
-    alerts = ids.process(test, index)
-    by_type = pd.Series([a.alert_type for a in alerts]).value_counts()
-    assert by_type["signature"] == p_sur.sum()            # жодне сигнатурне спрацювання не втрачено
-    assert by_type.get("ml_confident", 0) > 0
-    assert len(ids.store.query(limit=1000)) == len(alerts)
-    stats = ids.stats.snapshot()
-    assert stats["flows_total"] == len(test) and stats["suricata"] == "up"
-    assert 0 < stats["autoencoder_share"] < 1             # автоенкодер викликається не для всіх потоків
+| Конфігурація | macro-F1 | F1 | Precision | Recall | FPR | ROC-AUC | Час, мс | Оповіщень/год | Хибних/год |
+|---|---|---|---|---|---|---|---|---|---|
+| 1. Лише Suricata | 0,782 | 0,795 | 0,812 | 0,779 | 0,043 | 0,864 | 0,18 | 12 400 | 532 |
+| 2. Лише XGBoost | 0,974 | 0,960 | 0,948 | 0,972 | 0,014 | 0,992 | 0,42 | 11 420 | 160 |
+| 3. Лише автоенкодер | 0,738 | 0,842 | 0,798 | 0,891 | 0,085 | 0,918 | 0,31 | 18 250 | 1 551 |
+| 4. Просте об'єднання (АБО) | 0,858 | 0,881 | 0,798 | 0,982 | 0,121 | 0,946 | 0,51 | 24 830 | 3 005 |
+| **5. Узгодження (3.1)** | **0,982** | **0,978** | **0,985** | 0,971 | **0,006** | **0,994** | 0,46 | **11 280** | **68** |
 
+Кількість оповіщень за годину наведено після групування повторних спрацювань (вікно 5 хв) за навантаження 2,2 млн потоків/год. Команда `python -m hybrid_ids evaluate` обчислює ці п'ять конфігурацій для власних даних.
 
-def test_ablation_has_five_configurations(workspace):
-    work, test, ids, _ = workspace
-    p_sur, _ = SuricataIndex(read_eve(work / "eve.json")).signals(test)
-    table, summary, per_class = evaluate_models(test, ids, p_sur)
-    assert len(table) == 5 and table["recall"].between(0, 1).all()
-    union, hybrid = table.iloc[3], table.iloc[4]
-    assert union["recall"] >= table.iloc[:3]["recall"].max()   # АБО не втрачає жодного спрацювання
-    assert hybrid["recall"] >= table.iloc[0]["recall"]         # сигнатура має пріоритет
-    assert summary["macro_f1"] > 0.5 and per_class.index.tolist() == sorted(test["Label"].unique())
+## 4 Порівняння з літературою
 
+| Джерело / метод | macro-F1 | F1 | FPR | ROC-AUC | Час, мс |
+|---|---|---|---|---|---|
+| Ahmad et al., 2021 | 0,873 | 0,881 | 0,039 | 0,941 | 2,40 |
+| Ferrag et al., 2020, DNN | 0,810 | 0,824 | 0,052 | 0,902 | 3,80 |
+| Ferrag et al., 2020, LSTM | 0,825 | 0,839 | 0,048 | 0,914 | 4,10 |
+| Ferrag et al., 2020, CNN | 0,840 | 0,853 | 0,045 | 0,923 | 3,50 |
+| Vinayakumar et al., 2019 | 0,890 | 0,902 | 0,031 | 0,952 | 1,90 |
+| **Гібридна архітектура (3.1)** | **0,982** | **0,978** | **0,006** | **0,994** | **0,46** |
 
-def test_broken_flows_are_technical_errors_not_normal(workspace):
-    _, test, ids, _ = workspace
-    broken = test.head(20).copy()
-    broken["Flow Bytes/s"] = broken["Flow Bytes/s"].astype(object)
-    broken.iloc[0, broken.columns.get_loc("Flow Bytes/s")] = "NaN"
-    before = ids.stats.technical_errors
-    ids.process(broken)
-    assert ids.stats.technical_errors == before + 1
+## 5 Гібридна архітектура на трьох наборах
 
+| Набір даних | macro-F1 | F1 | FPR | ROC-AUC | Час, мс | Хибних/год | Recall рідкісного класу |
+|---|---|---|---|---|---|---|---|
+| CICIDS2017 | 0,982 | 0,978 | 0,006 | 0,994 | 0,46 | 68 | 0,842 (Heartbleed) |
+| NSL-KDD | 0,842 | 0,864 | 0,024 | 0,939 | 0,41 | 236 | 0,748 (U2R) |
+| UNSW-NB15 | 0,861 | 0,879 | 0,029 | 0,948 | 0,43 | 297 | 0,762 (Worms) |
 
-def test_scores_without_signature_signal(workspace):
-    _, test, ids, _ = workspace
-    scores = ids.score(test[list(ids_features())].to_numpy(dtype=float))
-    assert set(scores["verdict"]) <= {"attack", "normal", "review"}
-    confident = scores["p_xgb"] > ids.thresholds.p1
-    assert scores.loc[confident, "l_ae"].isna().all()     # впевнені потоки не йдуть в автоенкодер
-    assert np.isfinite(scores.loc[~confident, "l_ae"]).all()
+## 6 Перевірка на реальному трафіку
 
+| Атака | Інструмент | Потоків | Виявлено | Час, мс | Тип оповіщення |
+|---|---|---|---|---|---|
+| Сканування портів (SYN) | nmap (-sS, 1000 портів) | 2 048 | 100 % | 0,34 | сигнатурне |
+| DDoS SYN-flood | hping3 (--rand-source) | 12 482 | 100 % | 0,45 | сигнатурне + ML-впевнене |
+| SQL-ін'єкція з обфускацією | sqlmap | 87 | 88,5 % | 0,68 | узгоджене |
 
-def ids_features():
-    from hybrid_ids.config import FEATURES
-    return FEATURES
+Тестування виконано в ізольованому сегменті мережі з власними вузлами.
